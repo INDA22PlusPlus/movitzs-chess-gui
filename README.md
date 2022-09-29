@@ -1,0 +1,1 @@
+pieces stolen from https://github.com/lichess-org/lila/tree/master/public/piece/horsey

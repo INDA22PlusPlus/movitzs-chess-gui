@@ -1,0 +1,12 @@
+[package]
+name = "hw2-chess-gui"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# adamvib-chess = { git = "https://github.com/INDA22PlusPlus/adamvib-chess" }
+hw1-chess = { git = "https://github.com/INDA22PlusPlus/movitzs-chess" }
+piston_window = "0.124.0"
+lazy_static = "1.4.0"
