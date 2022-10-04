@@ -62,7 +62,7 @@ async fn main() {
             });
 
             let mut g = Game::new(board, socket);
-            g.loopa();
+            g.loopa().await;
         }
         "client" => {
             let socket = TcpStream::connect(format!(
@@ -81,7 +81,7 @@ async fn main() {
             });
 
             let mut g = Game::new(board, socket_clone);
-            g.loopa();
+            g.loopa().await;
         }
         _ => {
             panic!("sad");
@@ -205,9 +205,9 @@ impl Game {
         }
     }
 
-    fn loopa(&mut self) {
+    async fn loopa(&mut self) {
         while let Some(e) = self.window.next() {
-            self.draw(e);
+            self.draw(e).await;
         }
     }
 
@@ -237,7 +237,7 @@ impl Game {
 
                         let ss = self.socket.clone();
 
-                        /*tokio::spawn(async move {
+                        tokio::spawn(async move {
                             let x = C2sMessage {
                                 msg: Some(net::c2s_message::Msg::Move(Move {
                                     from_square: mov.from as u32,
@@ -246,10 +246,13 @@ impl Game {
                                 })),
                             };
 
+                            println!("sending cmd");
                             let mut buf = Vec::new();
                             x.encode(&mut buf).unwrap();
                             ss.lock().await.write(&buf).await;
-                        });*/
+
+                            println!("sent command");
+                        });
 
                         self.selected_square = 65;
                         if res.is_err() {
