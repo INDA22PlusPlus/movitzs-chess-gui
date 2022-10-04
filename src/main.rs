@@ -3,23 +3,24 @@ extern crate piston_window;
 
 mod net;
 use clap::Parser;
+use core::panic;
 use net::S2cMessage;
 use prost::Message;
 use std::{
     f32::consts::PI,
     sync::{Arc, Mutex},
 };
-use tokio::sync::Mutex as TokioMutex;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::broadcast::{self, Receiver, Sender},
 };
 
 // use adamvib_chess as chess;
-use hw1_chess::{self as chess, cmove::CMove, Board};
+use hw1_chess::{self as chess, cmove::CMove, piece::PieceColor, Board};
 use piston_window::{color::hex, *};
 
-use crate::net::{C2sConnectRequest, C2sMessage, Move};
+use crate::net::{C2sConnectRequest, C2sMessage, Move, S2cConnectAck};
 
 const CHESS_SQUARE_LENGTH: u32 = 90;
 const GUI_LENGTH: u32 = CHESS_SQUARE_LENGTH * 8;
@@ -45,27 +46,26 @@ async fn main() {
     let args = Args::parse();
 
     let board = Arc::new(Mutex::new(Board::new()));
-
     let board2 = board.clone();
 
     match args.mode.as_str() {
         "server" => {
-            let listener = TcpListener::bind("127.0.0.1:1337").await.unwrap();
+            let listener = TcpListener::bind("0.0.0.0:1337").await.unwrap();
 
-            let (socket, _) = listener.accept().await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (tx, rx) = broadcast::channel::<(u8, u8)>(10);
 
-            let socket = Arc::new(TokioMutex::new(socket));
-            let socket_clone = socket.clone();
+            s2c_get_accept_conn_req(&mut socket).await;
 
             tokio::spawn(async move {
-                big_server_big_money(socket_clone, board2).await;
+                big_server_big_money(socket, rx, board2).await;
             });
 
-            let mut g = Game::new(board, socket);
+            let mut g = Game::new(board, tx, true);
             g.loopa().await;
         }
         "client" => {
-            let socket = TcpStream::connect(format!(
+            let mut socket = TcpStream::connect(format!(
                 "{}:{}",
                 args.server_addr.unwrap(),
                 args.server_port.unwrap()
@@ -73,14 +73,37 @@ async fn main() {
             .await
             .unwrap();
 
-            let socket = Arc::new(TokioMutex::new(socket));
+            let (tx, rx) = broadcast::channel::<(u8, u8)>(10);
 
-            let socket_clone = socket.clone();
+            c2s_send_conn(&mut socket).await;
+            println!("sent conn req");
+
+            // get conn ack
+
+            let mut buf = [0_u8; 100];
+            let n = socket.read(&mut buf).await;
+            let x: Result<S2cMessage, _> = prost::Message::decode(&buf[0..n.unwrap()]);
+
+            let mut is_white = false;
+            match x.unwrap().msg.unwrap() {
+                net::s2c_message::Msg::ConnectAck(x) => {
+                    if !x.success {
+                        panic!("could not connect");
+                    }
+
+                    is_white = x.client_is_white.unwrap();
+                    println!("starting fen {}", x.starting_position.unwrap().fen_string);
+                }
+                _ => {
+                    panic!("did not get conn ack");
+                }
+            }
+
             tokio::spawn(async move {
-                small_client_small_money(socket, board2).await;
+                small_client_small_money(socket, rx, board2).await;
             });
 
-            let mut g = Game::new(board, socket_clone);
+            let mut g = Game::new(board, tx, is_white);
             g.loopa().await;
         }
         _ => {
@@ -89,7 +112,37 @@ async fn main() {
     }
 }
 
-async fn small_client_small_money(socket: Arc<TokioMutex<TcpStream>>, board: Arc<Mutex<Board>>) {
+async fn s2c_get_accept_conn_req(socket: &mut TcpStream) {
+    let mut buf = [0_u8; 100];
+    let n = socket.read(&mut buf).await;
+    let x: Result<C2sMessage, _> = prost::Message::decode(&buf[0..n.unwrap()]);
+
+    match x.unwrap().msg.unwrap() {
+        net::c2s_message::Msg::ConnectRequest(x) => {
+            if x.spectate {
+                panic!("not implemented");
+            }
+
+            let x = S2cMessage {
+                msg: Some(net::s2c_message::Msg::ConnectAck(S2cConnectAck {
+                    success: true,
+                    game_id: Some(x.game_id),
+                    client_is_white: Some(false),
+                    starting_position: Some(net::BoardState {
+                        fen_string: "hej".to_owned(),
+                    }),
+                })),
+            };
+
+            let mut buf: Vec<u8> = Vec::new();
+            prost::Message::encode(&x, &mut buf).unwrap();
+            socket.write(&buf).await.unwrap();
+        }
+        _ => panic!("it is not the time for this"),
+    }
+}
+
+async fn c2s_send_conn(socket: &mut TcpStream) {
     let x = C2sMessage {
         msg: Some(net::c2s_message::Msg::ConnectRequest(C2sConnectRequest {
             game_id: 69,
@@ -98,74 +151,139 @@ async fn small_client_small_money(socket: Arc<TokioMutex<TcpStream>>, board: Arc
     };
     let mut buf: Vec<u8> = Vec::new();
     prost::Message::encode(&x, &mut buf).unwrap();
+    socket.write(&buf).await.unwrap();
+}
 
-    let mut s = socket.lock().await;
-    s.write(&buf).await.unwrap();
+async fn s2c_send_move(x: (u8, u8), socket: &mut TcpStream) {
+    let x = C2sMessage {
+        msg: Some(net::c2s_message::Msg::Move(Move {
+            from_square: x.0 as u32,
+            to_square: x.1 as u32,
+            promotion: None,
+        })),
+    };
 
+    let mut buf = Vec::new();
+    x.encode(&mut buf).unwrap();
+    socket.write(&buf).await;
+}
+
+async fn c2s_send_move(x: (u8, u8), socket: &mut TcpStream) {
+    let x = C2sMessage {
+        msg: Some(net::c2s_message::Msg::Move(Move {
+            from_square: x.0 as u32,
+            to_square: x.1 as u32,
+            promotion: None,
+        })),
+    };
+
+    let mut buf = Vec::new();
+    x.encode(&mut buf).unwrap();
+    socket.write(&buf).await;
+}
+
+async fn small_client_small_money(
+    mut socket: TcpStream,
+    mut rx: Receiver<(u8, u8)>,
+    board: Arc<Mutex<Board>>,
+) {
     loop {
         let mut buf = [0_u8; 512];
-        let n = socket.lock().await.read(&mut buf).await.unwrap();
-
-        let x: Result<S2cMessage, _> = prost::Message::decode(&buf[0..n]);
-
-        if x.is_err() {
-            println!("invalid msg, dropping client");
-
-            socket
-                .lock()
-                .await
-                .write_buf(&mut "vafan håller du på med\n".as_bytes())
-                .await
-                .unwrap();
-
-            socket.lock().await.shutdown().await;
-            return;
-        }
-
-        match x.unwrap().msg.unwrap() {
-            net::s2c_message::Msg::Move(x) => {
-                board
-                    .lock()
-                    .unwrap()
-                    .make_move(&CMove {
-                        from: x.from_square as u8,
-                        to: x.to_square as u8,
-                        promote_to: hw1_chess::piece::PieceType::Queen,
-                    })
-                    .unwrap();
+        tokio::select! {
+            x = rx.recv() => {
+                c2s_send_move(x.unwrap(), &mut socket).await;
             }
-            net::s2c_message::Msg::ConnectAck(_) => todo!(),
-            net::s2c_message::Msg::MoveAck(_) => todo!(),
+            n = socket.read(&mut buf) => {
+                let x: Result<S2cMessage, _> = prost::Message::decode(&buf[0..n.unwrap()]);
+
+                if x.is_err() {
+                    println!("invalid msg, dropping client");
+
+                    socket
+                        .write_buf(&mut "vafan håller du på med\n".as_bytes())
+                        .await
+                        .unwrap();
+
+                    socket.shutdown().await;
+                    return;
+                }
+
+                match x.unwrap().msg.unwrap() {
+                    net::s2c_message::Msg::Move(x) => {
+                        let r = board
+                            .lock()
+                            .unwrap()
+                            .make_move(&CMove {
+                                from: x.from_square as u8,
+                                to: x.to_square as u8,
+                                promote_to: hw1_chess::piece::PieceType::Queen,
+                            }).unwrap();
+                    }
+                    net::s2c_message::Msg::ConnectAck(x) => {
+                        if !x.success {
+                            println!("could not connect");
+                            println!("game id: {:?}", x.game_id);
+                            println!("")
+
+                        }
+                    },
+                    net::s2c_message::Msg::MoveAck(x) => {
+                        if !x.legal {
+                            println!("move was not legal");
+                            println!("actual state is {}", x.board_result.unwrap().fen_string);
+                        }
+                    },
+                }
+            }
         }
     }
 }
 
-async fn big_server_big_money(socket: Arc<TokioMutex<TcpStream>>, board: Arc<Mutex<Board>>) {
+async fn big_server_big_money(
+    mut socket: TcpStream,
+    mut rx: Receiver<(u8, u8)>,
+    board: Arc<Mutex<Board>>,
+) {
     loop {
         let mut buf = [0_u8; 512];
 
-        let n = socket.lock().await.read(&mut buf).await.unwrap();
-
-        let x: Result<C2sMessage, _> = prost::Message::decode(&buf[0..n]);
-
-        if x.is_err() {
-            println!("invalid msg, dropping client");
-            return;
-        }
-
-        match x.unwrap().msg.unwrap() {
-            net::c2s_message::Msg::Move(x) => {
-                println!("got move");
-                board.lock().unwrap().make_move(&CMove {
-                    from: x.from_square as u8,
-                    to: x.to_square as u8,
-                    promote_to: hw1_chess::piece::PieceType::Queen,
-                });
+        tokio::select! {
+            x = rx.recv() => {
+                s2c_send_move(x.unwrap(), &mut socket).await;
             }
-            net::c2s_message::Msg::ConnectRequest(x) => {
-                println!("got conn");
-                if x.spectate {
+            n = socket.read(&mut buf) => {
+
+                let x: Result<C2sMessage, _> = prost::Message::decode(&buf[0..n.unwrap()]);
+
+                if x.is_err() {
                     return;
+                }
+
+                match x.unwrap().msg.unwrap() {
+                    net::c2s_message::Msg::Move(x) => {
+                        let r = board.lock().unwrap().make_move(&CMove {
+                            from: x.from_square as u8,
+                            to: x.to_square as u8,
+                            promote_to: hw1_chess::piece::PieceType::Queen,
+                        });
+
+
+                        let x = S2cMessage {
+                            msg: Some(net::s2c_message::Msg::MoveAck(net::S2cMoveAck {
+                                legal: r.is_ok(),
+                                board_result: Some(net::BoardState { fen_string: board.lock().unwrap().to_fen() }),
+                            })),
+                        };
+
+                        let mut buf = Vec::new();
+                        x.encode(&mut buf).unwrap();
+                        socket.write(&buf).await;
+                    }
+                    net::c2s_message::Msg::ConnectRequest(x) => {
+                        if x.spectate {
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -174,7 +292,8 @@ async fn big_server_big_money(socket: Arc<TokioMutex<TcpStream>>, board: Arc<Mut
 
 struct Game {
     board: Arc<Mutex<Board>>,
-    socket: Arc<TokioMutex<TcpStream>>,
+    is_white: bool,
+    tx: Sender<(u8, u8)>,
     mouse_cursor: [f64; 2],
     selected_square: u32,
     dragged_square: u32,
@@ -184,7 +303,7 @@ struct Game {
 }
 
 impl Game {
-    fn new(board: Arc<Mutex<Board>>, socket: Arc<TokioMutex<TcpStream>>) -> Self {
+    fn new(board: Arc<Mutex<Board>>, tx: Sender<(u8, u8)>, is_white: bool) -> Self {
         let mut window: PistonWindow =
             WindowSettings::new("Big chess big money", [GUI_LENGTH, GUI_HEIGHT])
                 .exit_on_esc(true)
@@ -195,13 +314,14 @@ impl Game {
 
         Game {
             board,
-            socket,
+            tx,
             mouse_cursor: [0.0, 0.0],
             hovered_square: 65,
             dragged_square: 65,
             selected_square: 65,
             window,
             images,
+            is_white,
         }
     }
 
@@ -234,25 +354,7 @@ impl Game {
                             promote_to: chess::piece::PieceType::Queen,
                         };
                         let res = board.make_move(&mov);
-
-                        let ss = self.socket.clone();
-
-                        tokio::spawn(async move {
-                            let x = C2sMessage {
-                                msg: Some(net::c2s_message::Msg::Move(Move {
-                                    from_square: mov.from as u32,
-                                    to_square: mov.to as u32,
-                                    promotion: None,
-                                })),
-                            };
-
-                            println!("sending cmd");
-                            let mut buf = Vec::new();
-                            x.encode(&mut buf).unwrap();
-                            ss.lock().await.write(&buf).await;
-
-                            println!("sent command");
-                        });
+                        self.tx.send((mov.from, mov.to));
 
                         self.selected_square = 65;
                         if res.is_err() {
@@ -266,11 +368,16 @@ impl Game {
                 }
                 if x.state == ButtonState::Press {
                     let p = pieces[self.hovered_square as usize];
-                    if p.is_some() && p.unwrap().get_color() == board.get_active_color() {
-                        self.dragged_square = self.hovered_square;
-                        self.selected_square = self.hovered_square;
-                    } else if self.selected_square < 64 {
-                        self.selected_square = 65;
+                    if p.is_some() {
+                        let p = p.unwrap();
+                        if p.get_color() == board.get_active_color()
+                            && (p.get_color() == PieceColor::White) == self.is_white
+                        {
+                            self.dragged_square = self.hovered_square;
+                            self.selected_square = self.hovered_square;
+                        } else if self.selected_square < 64 {
+                            self.selected_square = 65;
+                        }
                     }
                 }
             }
