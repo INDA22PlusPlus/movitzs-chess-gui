@@ -10,3 +10,7 @@ edition = "2021"
 hw1-chess = { git = "https://github.com/INDA22PlusPlus/movitzs-chess" }
 piston_window = "0.124.0"
 lazy_static = "1.4.0"
+prost = "0.10"
+clap = { version = "4.0.8", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"

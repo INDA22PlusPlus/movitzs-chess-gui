@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package networking_prep.networking;
+
+enum Piece {
+	Pawn = 0;
+	Knight = 1;
+	Bishop = 2;
+	Rook = 3;
+	Queen = 4;
+	King = 5;
+}
+
+message C2SConnectRequest {
+	uint64 game_id = 1;
+	bool spectate = 2;
+}
+
+message S2CConnectAck {
+	bool success = 1;
+	optional uint64 game_id = 2; 
+	optional BoardState starting_position = 3;
+	optional bool client_is_white = 4;
+}
+
+message Move {
+	uint32 from_square = 1;
+	uint32 to_square = 2;
+	optional Piece promotion = 3;
+}
+
+message S2CMoveAck {
+	bool legal = 1;
+	BoardState board_result = 2; 
+}
+
+message S2CMessage {
+	oneof msg {
+		Move move = 1;
+		S2CConnectAck connect_ack = 2;
+		S2CMoveAck move_ack = 3;
+	}
+}
+message C2SMessage {
+	oneof msg {
+		Move move = 1;
+		C2SConnectRequest connect_request = 2;
+	}
+}
+
+message BoardState {
+	string fen_string = 1;
+}
